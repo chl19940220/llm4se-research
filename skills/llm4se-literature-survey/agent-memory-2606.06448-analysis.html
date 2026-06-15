@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent Memory 论文深度解读</title>
+<style>
+:root{--text:#1a1a1a;--bg:#fafaf8;--accent:#2563eb;--muted:#6b7280;--border:#e5e7eb;--code-bg:#f3f4f6;--panel:#ffffff}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,"PingFang SC","Noto Serif SC",serif;color:var(--text);background:var(--bg);line-height:1.85;padding:2.5rem 1.5rem;max-width:860px;margin:0 auto;font-size:17px}
+h1{font-size:2rem;margin:0 0 .4rem;line-height:1.3}
+h2{font-size:1.35rem;margin:2.8rem 0 .8rem;color:var(--accent);padding-bottom:.4rem;border-bottom:1px solid var(--border)}
+h3{font-size:1.08rem;margin:1.6rem 0 .5rem;color:#333}
+.meta{color:var(--muted);font-size:.92rem;margin-bottom:2rem;line-height:1.8}
+.meta a{color:var(--accent);text-decoration:none}
+p{margin:1rem 0}
+strong{color:#111}
+blockquote{border-left:3px solid var(--accent);padding:.6rem 1.2rem;margin:1.5rem 0;background:#f0f4ff;border-radius:0 8px 8px 0}
+pre{background:var(--code-bg);padding:1rem 1.2rem;border-radius:8px;overflow-x:auto;font-size:.85rem;line-height:1.5;margin:1.5rem 0;border:1px solid var(--border)}
+code{font-family:"SF Mono","Fira Code",monospace;font-size:.9em}
+table{width:100%;border-collapse:collapse;margin:1.5rem 0;font-size:.93rem;background:var(--panel)}
+td,th{border:1px solid var(--border);padding:.62rem .82rem;text-align:left;vertical-align:top}
+th{background:#f9fafb;font-weight:600}
+.summary-box{background:linear-gradient(135deg,#f0f4ff,#faf5ff);padding:1.35rem;border-radius:8px;margin:1.5rem 0;border:1px solid #dbe4ff}
+.summary-box h3{margin:0 0 .5rem;color:var(--accent)}
+.note{color:var(--muted);font-size:.94rem}
+.figure-ref{background:#fff;border:1px solid var(--border);border-radius:8px;padding:1rem 1.1rem;margin:1rem 0}
+.figure-ref strong{color:var(--accent)}
+.golden{font-size:1.2rem;font-weight:600;color:var(--accent);text-align:center;padding:2rem 1rem;border-top:2px solid var(--accent);border-bottom:2px solid var(--accent);margin:2.5rem 0;line-height:1.55}
+@media(max-width:600px){body{font-size:16px;padding:1.2rem 1rem}h1{font-size:1.5rem}table{font-size:.85rem}}
+</style>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+  onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}]})"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad:true,theme:'default',securityLevel:'loose'});</script>
+</head>
+<body>
+<h1>Agent Memory: Characterization and System Implications of Stateful Long-Horizon Workloads</h1>
+<div class="meta">
+论文：<a href="https://arxiv.org/abs/2606.06448">arXiv:2606.06448</a><br>
+作者：Yasmine Omri, Ziyu Gan, Zachary Broveak, Robin Geens, Zexue He, Alex Pentland, Marian Verhelst, Tsachy Weissman, Thierry Tambe<br>
+分析风格：academic。代码状态：论文自己的 phase-aware profiling harness 标注为待开源；未在论文源码、GitHub 检索或公开搜索中发现对应仓库。
+</div>
+
+<div class="summary-box">
+<h3>一句话总结</h3>
+<p>这篇论文不是提出一个新的记忆算法，而是把 agent memory 当作系统负载来研究：作者把十个代表性记忆系统拆成构建、检索和生成三个阶段，证明真正昂贵的往往不是回答问题，而是在后台把长期交互历史写成可检索、可维护、可更新的记忆状态。</p>
+</div>
+
+<h2>1. 研究背景与动机</h2>
+<p>长程 LLM agent 的核心矛盾是状态会持续增长，而单次推理上下文不是无限的。一个个人助理会积累用户偏好，一个代码 agent 会保留项目上下文，一个深度研究 agent 会在多轮调查中积累证据。只把全部历史塞进 prompt，短期看简单，长期看会受到上下文长度、prefill 成本、KV cache 压力和长上下文召回退化的共同限制。</p>
+
+<p>论文把 agent memory 与传统 RAG 的区别说得很清楚：RAG 面对的是相对静态的外部语料，而 agent memory 面对的是 agent 自己生成和更新的可变状态。换言之，记忆不是一个只读检索库，而是一个有写路径、读路径、维护策略和一致性约束的系统组件。</p>
+
+<p>这个视角很重要。现有 benchmark 往往只看最终准确率，但部署者真正关心的是端到端成本：写入一次记忆要多少 LLM 调用和 embedding 调用，查询时要多长延迟，内存和磁盘占用如何随用户历史增长，后台写入如果落后会不会让后续会话读到过期状态。论文的贡献就在于把这些被准确率掩盖的系统代价显式量化。</p>
+
+<p>作者围绕三个问题展开：第一，不同 agent memory 范式的核心权衡是什么；第二，这些负载对部署基础设施提出了什么要求；第三，构建方式、存储组织、检索策略和更新策略如何塑造 GPU 利用率、带宽、延迟和可扩展性等系统行为。</p>
+
+<h2>2. 预备知识：把记忆系统看成三段式流水线</h2>
+<p>论文将 agent memory 的执行过程拆成七个阶段：ingestion、memory construction、storage、retrieval、prompt assembly、generation 和 maintenance。为了理解后续实验，可以把它压缩成一个更系统化的公式：</p>
+
+<p>$$M = C(H),\qquad R_q = \operatorname{Retrieve}(M,q),\qquad y = G(q,R_q)$$</p>
+<p>这里 $H$ 是历史交互流，$C$ 是记忆构建过程，$M$ 是持久化后的记忆库，$R_q$ 是针对当前查询 $q$ 检索出的记忆，$G$ 是最终回答模型。这个公式的含义是：同样的回答模型 $G$，可能因为 $C$ 和 $\operatorname{Retrieve}$ 的设计不同而产生完全不同的系统成本。</p>
+
+<p>构建阶段是本文最关键的对象。它可以完全不存在，例如 long-context baseline 直接保留原始上下文；也可以是确定性索引，例如 BM25 或 embedding RAG；还可以由 LLM 提取事实、摘要、三元组或结构化记录；更复杂的系统会让 LLM 作为控制器决定何时写入、如何搜索、是否更新旧记录。</p>
+
+<pre class="mermaid">flowchart TB
+    H[Interaction history] --> I[Ingestion]
+    I --> C[Memory construction]
+    C --> S[Persistent memory store]
+    S --> R[Retrieval]
+    R --> P[Prompt assembly]
+    P --> G[Answer generation]
+    G --> U[Maintenance and update]
+    U --> S
+</pre>
+
+<p>这张图对应论文 Fig. 1 的基本思想：agent 拥有短期工作上下文和长期记忆，长期记忆不是一次性文档索引，而是会被持续读取、追加、压缩、重写或合并的状态。</p>
+
+<h2>3. 方法详解：四类 agent memory 范式</h2>
+<p>论文的第一个贡献是一个系统导向的 taxonomy。它没有按算法名称分类，而是按构建、存储、检索和可变性四个轴分类。这个分类的价值在于，它能预测系统负载的形状：是否需要 LLM 写入，是否需要 embedding，是否会维护图结构，检索是否固定深度，记忆是否 append-only 或可变。</p>
+
+<h3>3.1 Paradigm I: Long-context memory</h3>
+<p>Long-context memory 不建立外部记忆库，而是把历史原文直接放进上下文。它的优点是实现简单，不需要额外构建或索引；缺点是每次查询都要重复支付长历史 prefill 代价。论文明确指出，当历史增长时，prefill 代价随历史长度上升，并且长上下文中间信息容易被忽略。</p>
+
+<p>可以把这种代价写成近似形式：</p>
+<p>$$T_{\text{prefill}}(L) \propto L^2$$</p>
+<p>这里 $L$ 是历史 token 长度。人话解释是：如果每次回答都读完整历史，历史越长，每次查询的前置计算越重；这不是一次性成本，而是每个 query 都会重复支付的成本。</p>
+
+<h3>3.2 Paradigm II: Flat RAG memory</h3>
+<p>Flat RAG 包括 BM25 和 embedRAG。它们把历史切块后建立倒排索引或向量索引，查询时做 top-$k$ 检索。它们的写路径很轻，基本不调用 LLM，因此构建成本低、延迟稳定。论文实验中，BM25 在 MemoryAgentBench 的宏平均准确率甚至最高，这说明简单词法检索在许多 recall-heavy 任务上仍然非常有竞争力。</p>
+
+<p>但是 BM25 的强表现不能被泛化成“结构化记忆没必要”。论文也强调，宏平均结果会被精确匹配型任务放大；当问题需要改写匹配、多跳推理、时间推理或跨会话状态更新时，结构增强和 agentic 记忆才更有动机。</p>
+
+<h3>3.3 Paradigm III: Structure-augmented RAG memory</h3>
+<p>第三类系统使用 LLM 在写入阶段提取结构化信息。GraphRAG 和 HippoRAG v2 偏 append-only，把实体、关系、事实、段落等多视图结构写进图或多视图索引；Mem0 和 SimpleMem 则会把对话压缩成事实或记忆条目，并可能合并、更新或删除旧记录。</p>
+
+<p>这类方法的关键权衡是把成本从查询时转移到构建时。以 Mem0 为例，它将历史蒸馏成 atomic facts，使得查询阶段很快，但写入时要调用 LLM 进行事实提取和 ADD/UPDATE/DELETE 判断。论文用一个很短的原文短语概括这种负载形状：long-read, short-write。</p>
+
+<h3>3.4 Paradigm IV: Agentic control flow</h3>
+<p>第四类系统包括 A-Mem、Letta 和 MIRIX。它们把记忆操作暴露给 LLM 控制流，LLM 可以决定什么时候写、写到哪里、是否调用工具、是否继续检索。它们的表达能力更强，但代价是控制流深度变得不稳定。</p>
+
+<p>这种不稳定性可以用一个简单形式表达：</p>
+<p>$$T_{\text{phase}} = \sum_{i=1}^{N(q,H)} t_i$$</p>
+<p>其中 $N(q,H)$ 是由 LLM 在运行时决定的调用轮数。人话解释是：如果算法本身没有固定停止深度，延迟就不只由输入长度决定，还由模型当场决定“还要不要再搜一次、再反思一次、再写一次”。因此作者建议必须用 iteration cap 或 timeout 约束最坏情况。</p>
+
+<div class="figure-ref"><strong>Table 1.</strong> 论文的 Agent Memory Systems 表把十个系统放进四个范式，并列出 construction pipeline、agent DB、retrieval pipeline 和 mutability。这张表是整篇文章的方法骨架。</div>
+
+<h2>4. Profiling harness：为什么要按阶段计量</h2>
+<p>论文的第二个贡献是 phase-aware profiling harness。它把 agent memory 的成本分到三个逻辑阶段：construction、retrieval 和 generation，并同时记录 API telemetry 与 hardware telemetry。API 侧记录 LLM 调用、embedding 调用、token 数、延迟、调用来源和所属阶段；硬件侧记录 GPU power、utilization、VRAM、SM activity、tensor-core activity 和 HBM bandwidth。</p>
+
+<p>这个设计解决了一个常见误判：用户感知到的 query latency 只是冰山一角。某个系统可能查询很快，但这是因为它已经在后台花了几个小时把历史重写成结构化记忆。只测 retrieval + generation 会让系统看起来很快，但没有计算完整生命周期成本。</p>
+
+<p>论文的实验包含两个 benchmark。MemoryAgentBench 作为主 benchmark，把长上下文任务转换成增量多轮输入流，覆盖准确检索、test-time learning、长程理解和 selective forgetting。论文重点分析 LongMemEval_S_*：五个样本，每个约 360K token 历史，每个 60 个查询，总计 300 个查询。MemoryArena 用于分析跨会话依赖下的 freshness-latency tradeoff。</p>
+
+<div class="figure-ref"><strong>Table 2.</strong> MemoryAgentBench workloads 表明任务长度从约 103K 到 1.44M token 不等，说明本文讨论的是超出普通单轮 prompt 的长期状态管理问题。</div>
+
+<h2>5. 实验分析一：query 快不等于系统便宜</h2>
+<p>Fig. 2 比较 long-context prompting 与外部 agent memory 的 per-query serving latency。结论很直观：外部记忆通常能显著降低查询阶段延迟。例如论文报告，在 GPT-4.1-mini API 设置下，Mem0 每个 query 小于 0.1 秒，而 long-context baseline 约 38 秒。</p>
+
+<p>但这只是 retrieval + generation，不包含 construction。论文随后展示，当把构建也算进去时，结论会完全变化。构建是部署者无法凭空消除的能耗成本，只是它可以被调度到后台，而不一定暴露给用户。</p>
+
+<table>
+<thead><tr><th>系统</th><th>准确率</th><th>总墙钟时间</th><th>调用数</th><th>总能耗 kJ</th><th>J/correct</th></tr></thead>
+<tbody>
+<tr><td>BM25</td><td>47.0</td><td>16.3m</td><td>300</td><td>582</td><td>4,128</td></tr>
+<tr><td>GraphRAG</td><td>46.0</td><td>1.83h</td><td>3,215</td><td>2,082</td><td>15,084</td></tr>
+<tr><td>A-Mem</td><td>42.7</td><td>11.76h</td><td>19,230</td><td>14,864</td><td>116,116</td></tr>
+<tr><td>Mem0</td><td>32.0</td><td>4.02h</td><td>4,538</td><td>4,878</td><td>50,813</td></tr>
+<tr><td>Letta</td><td>27.7</td><td>14.36h</td><td>18,394</td><td>15,429</td><td>185,873</td></tr>
+</tbody>
+</table>
+
+<p>这个表来自论文 Table 3 的核心数字。最重要的不是某个系统排名，而是数量级差异：BM25 与 Letta 的总能耗相差约 26.5 倍，J/correct 相差约 45 倍。论文正文还指出，能耗 per correct 在整套系统中超过 47 倍差距。</p>
+
+<p>能耗归一化可以写成：</p>
+<p>$$E_{\text{per-correct}} = \frac{E_{\text{total}}}{N_{\text{queries}}\times \operatorname{Acc}}}$$</p>
+<p>这个公式在说：一个系统如果为了稍高或相近的准确率付出巨大构建成本，部署者应该把这个成本除以实际答对的样本数来比较，而不是只看 query latency。</p>
+
+<div class="figure-ref"><strong>Fig. 3 和 Fig. 4.</strong> Phase cost breakdown 与 Energy per correct answer 共同说明：许多 LLM-mediated 记忆系统的主要能耗在 construction，而不是 retrieval 或 final generation。</div>
+
+<h2>6. 实验分析二：construction 是 embedding-heavy 和 prefill-heavy</h2>
+<p>论文进一步分析 construction 的计算形状。结论是，构建阶段通常是长输入读取加短输出写入：embedding 模型没有 decode 阶段，LLM 提取事实、摘要、三元组或 JSON 结构时，读入的 chunk/window 很长，输出记录相对短。</p>
+
+<p>论文报告，construction token 中 decode 占比中位数只有 4.6%，Letta 低至 0.9%，SimpleMem 最高为 28.5%。这说明构建不像聊天生成，它更像后台索引构建：大量 prefill、大量 embedding、少量 decode。</p>
+
+<p>这个结论对系统部署很直接。QA 服务追求 time-to-first-token，construction 追求吞吐。如果两者共用同一个 LLM endpoint，后台构建任务会占用 KV-cache headroom 和 batch scheduler，影响前台用户查询。因此论文建议把 memory construction 当作后台吞吐型负载来做 admission control、batching、deferral 或独立调度。</p>
+
+<p>embedding 侧也有范式差异。GraphRAG 类系统会产生大 batch embedding traffic，例如论文报告 GraphRAG 约 2,300 sequences/API call，HippoRAG v2 约 125 sequences/call；而 Mem0 由于每个事实都要先 embedding 再做相似性判断，呈现接近 1:1 的 call-to-sequence 形态。这意味着同样是 embedding 服务，不同范式需要不同调度策略。</p>
+
+<div class="figure-ref"><strong>Fig. 5.</strong> Construction call structure and token decomposition 是本文最有系统启发性的图之一，它解释了为什么 agent memory construction 不应该被简单塞进普通在线 LLM serving 队列。</div>
+
+<h2>7. 实验分析三：小模型构建不是总能安全替换</h2>
+<p>既然 construction 很贵，一个自然想法是用更小的 LLM 来做构建，用更强的 LLM 来做最终回答。论文确实发现，对没有硬输出契约的系统，这通常是可调成本杠杆。例如 Mem0、SimpleMem、A-Mem 在构建模型缩小时表现为平滑退化。</p>
+
+<p>但这个杠杆不是无条件成立。MIRIX 在 Qwen3-1.7B 构建设置下完全失败，因为它依赖多个子 agent tool calls，需要严格合法的 JSON schema 和工具调用格式。小模型如果不能满足这些输出契约，就不是“准确率下降”，而是直接构建出损坏的记忆库。</p>
+
+<p>因此可以把安全下限写成：</p>
+<p>$$\operatorname{ValidStore}(C_m(H)) = 1 \quad \text{is a deployment precondition}$$</p>
+<p>这里 $C_m$ 表示由模型 $m$ 执行的构建过程。人话解释是：先确认小模型能生成结构合法、可检索、可维护的 store，再谈成本节省；否则后续 QA 模型再强也无法从坏 store 中恢复信息。</p>
+
+<h2>8. 实验分析四：construction, serving, accuracy 三者没有共同最优</h2>
+<p>论文的 construction-serve-accuracy frontier 说明，没有一个 agent memory system 同时在构建成本、查询延迟和准确率上最优。BM25 构建低于 1 秒，宏平均准确率 55.8%，但查询时间约 7.4 秒，慢于 Mem0、A-Mem 和 GraphRAG。Mem0 查询最低约 2.2 秒，但构建约 4,108 秒，准确率只有 26.8%。A-Mem 构建约 17,666 秒，是 suite 中最贵的一类。</p>
+
+<table>
+<thead><tr><th>系统或现象</th><th>论文报告的关键数字</th><th>系统含义</th></tr></thead>
+<tbody>
+<tr><td>BM25</td><td>构建低于 1 秒，宏平均准确率 55.8%</td><td>Recall-heavy 任务上简单词法索引很强，但不代表所有长程推理任务都适用。</td></tr>
+<tr><td>HippoRAG v2</td><td>准确率 47.4%，构建约 277 秒</td><td>结构视图带来更复杂索引，但成本仍低于重 agentic 系统。</td></tr>
+<tr><td>GraphRAG</td><td>准确率 47.0%，构建约 2,850 秒</td><td>图结构提取与 embedding traffic 明显提高写路径成本。</td></tr>
+<tr><td>Mem0</td><td>query latency 约 2.2 秒，构建约 4,108 秒</td><td>通过事实蒸馏换取快速读取，但后台写入成本高。</td></tr>
+<tr><td>SimpleMem</td><td>query latency 约 18.4 秒</td><td>多视图检索和反思轮次会把读路径变重。</td></tr>
+</tbody>
+</table>
+
+<p>这个 frontier 对部署的启发是：选择记忆系统不能只按准确率排序，而要匹配 workload 的查询到达模式。如果用户历史稳定、后续查询很多，可以接受高构建成本来换取快速查询；如果历史持续摄入但查询稀疏，低构建成本系统反而更合适。</p>
+
+<div class="figure-ref"><strong>Fig. 7.</strong> Construction-serve-accuracy frontier 同时展示三维权衡，避免把 agent memory 误判成单一 accuracy benchmark 问题。</div>
+
+<h2>9. 实验分析五：跨会话记忆有 freshness-latency tradeoff</h2>
+<p>批量构建后再查询是一种相对温和的设置。真实 agent 会不断发生新会话，而后续会话可能依赖前面会话写入的状态。此时，如果 construction 慢于会话到达速度，系统只有两个选择：同步写入，牺牲用户等待时间；异步写入，允许查询读到尚未更新的旧记忆。</p>
+
+<p>论文使用 MemoryArena physics split 做这个实验：20 个多会话任务，每个任务是一串有依赖的子任务。作者设置 5 秒 inter-session arrival schedule，模拟同步和异步调度。结果是 BM25 和 embedRAG 这类 Paradigm II 系统两种模式都能保持 fresh；SimpleMem、MIRIX、Letta、Mem0 和 A-Mem 在异步模式下会积累 staleness。</p>
+
+<p>staleness 可以形式化为：</p>
+<p>$$S_t = \left|\{i&lt;t \mid \operatorname{commit}_i &gt; \operatorname{arrival}_t\}\right|$$</p>
+<p>这里 $S_t$ 表示第 $t$ 次查询到达时，有多少此前会话的写入还没有提交。人话解释是：如果 $S_t>0$，当前 query 看到的记忆不是最新状态；对于跨会话依赖任务，这可能直接导致错误。</p>
+
+<p>可行性条件则可以写成：</p>
+<p>$$T_{\text{construct}} + T_{\text{retrieve}} \leq \Delta_{\text{arrival}}$$</p>
+<p>如果每个会话的写入和下一次读取总耗时超过会话到达间隔，系统迟早会积压。论文因此建议把 construction + retrieval cumulative time 当作硬约束，而不是简单性能偏好。</p>
+
+<div class="figure-ref"><strong>Fig. 8.</strong> MemoryArena 调度图展示了同步模式下的用户等待和异步模式下的 stale memory，两者是同一慢写路径问题的两种表现。</div>
+
+<h2>10. 实验分析六：长期成本由增长斜率决定</h2>
+<p>长期 agent 的记忆是 per-user 且持续增长的。论文把单用户历史从约 64K token 扩展到 1M token，观察构建时间、LLM token cost、检索延迟和磁盘占用。结果显示，磁盘占用在 1M token 时有约 9 倍差距：embedRAG 投影到 100K 用户约 0.7TB，HippoRAG v2 约 6.2TB。</p>
+
+<p>但作者强调，更危险的是 token-cost growth slope。Paradigm IV agentic 系统会在写入新记忆时查询、评估、合并或重写不断增长的 store，因此每次 ingestion 的成本可能随 store 规模上升，形成超线性增长。Letta 在 256K token 之后尤其陡峭。</p>
+
+<p>这个扩展关系可以写成：</p>
+<p>$$\frac{F_{\max}}{F_{\min}} \approx \frac{6.2\text{ TB}}{0.7\text{ TB}} \approx 8.9\times$$</p>
+<p>人话解释是：即使只看存储，系统选择也会带来近一个数量级差异；如果再看 LLM construction token，agentic 系统的长期成本可能比初始 footprint 更值得警惕。</p>
+
+<div class="figure-ref"><strong>Fig. 9.</strong> Scaling with input length 表明，检索延迟随 store 增长大体保持平稳，但 construction token cost 和磁盘 footprint 的增长形态在不同范式之间明显分化。</div>
+
+<h2>11. 代码与复现状态</h2>
+<p>论文明确写到 profiling harness 将开源，但当前 arXiv 源码、公开 GitHub 检索和 web 检索中没有发现该 harness 的仓库。因此本文不能给出“论文方法对应源码文件”的逐行映射。相关但不同的公开仓库包括 MemoryAgentBench 的官方仓库，以及若干被评估系统自己的实现，例如 Letta、Mem0、GraphRAG、HippoRAG、A-Mem、MIRIX 等。</p>
+
+<p>这个状态会影响复现深度。可以复现单个被评估系统的行为，但要复现论文的 phase attribution、API telemetry、hardware telemetry、energy integration 和 cross-system normalization，需要等待作者发布 harness，或者自行重建一套兼容的 instrumentation 层。</p>
+
+<pre><code>Paper harness status:
+- Phase-aware profiling harness: not public at analysis time
+- Paper source archive: available from arXiv
+- Evaluated benchmark code: MemoryAgentBench is public
+- Evaluated systems: several have independent public repositories
+</code></pre>
+
+<h2>12. 局限分析</h2>
+<p>第一，论文覆盖的是单节点、单 GPU、本地 vLLM 和远程 API 的组合设置。作者在 discussion 中也指出，多节点和多 agent 部署会引入额外的一致性与协调问题，单节点 characterization 无法完全覆盖这些问题。对于企业级 agent fleet，这一点很关键，因为记忆库可能分布在多个存储和推理服务之间。</p>
+
+<p>第二，论文主要讨论文本记忆。作者也提到 multimodal memory 是仍在成熟的方向。图像、音频、结构化观测和工具状态如果进入长期记忆，会进一步放大 construction cost、storage footprint 和 retrieval complexity。因此本文 taxonomy 是基础，但还不是多模态 agent memory 的完整系统模型。</p>
+
+<p>第三，我的独立判断是，论文的 benchmark 结论需要谨慎外推到软件工程 agent。代码 agent 的记忆不仅包括对话，还包括文件树、diff、测试结果、issue、设计约束和构建错误。BM25 在 recall-heavy benchmark 中表现强，不代表它能处理代码变更因果、跨文件依赖或长期设计决策。相反，结构化和 agentic 记忆是否值得付出构建成本，可能要在代码任务上重新评估。</p>
+
+<p>第四，论文 harness 尚未公开，使得读者暂时不能检查 instrumentation 的边界条件。例如 energy integration 的采样频率、阶段标记的准确性、vLLM batch scheduler 与 agent 调用之间的交互，都会影响最终数字。论文的系统结论很有价值，但更细的数值比较需要等代码发布后验证。</p>
+
+<h2>13. 结论</h2>
+<p>这篇论文的核心贡献，是把 agent memory 从“算法功能模块”重新定义为“部署时必须计量和调度的系统负载”。它证明了一个容易被忽略的事实：agent memory 的主要成本常常在后台 construction，而不是用户看到的 answer generation。</p>
+
+<p>对研究者来说，这篇论文提供了一个很好的分类框架：long-context、flat RAG、structure-augmented RAG、agentic control flow。对系统工程师来说，它给出更直接的启发：记忆系统选择必须同时看 construction cost、serving latency、accuracy、freshness、tail latency 和 per-user growth slope。</p>
+
+<p>如果把本文结论压缩成一句话，就是：长期 agent 的记忆能力不是免费的，真正决定能否规模化部署的，是写路径、读路径和维护路径能否被明确建模、计量和约束。</p>
+
+<div class="golden">Agent memory 的研究重点正在从“能不能记住”转向“以什么系统代价记住，以及在多长时间尺度上仍然值得记住”。</div>
+</body>
+</html>
